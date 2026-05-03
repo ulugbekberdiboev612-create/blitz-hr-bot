@@ -1,21 +1,11 @@
-import asyncio
-import logging
-import os
-import json
 
+import telebot
 import google.generativeai as genai
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, Document
-from aiogram.filters import CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-
-logging.basicConfig(level=logging.INFO)
+import os
+import json
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 HR_CHAT_ID = os.getenv("HR_CHAT_ID")
@@ -23,77 +13,64 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+bot = telebot.TeleBot(BOT_TOKEN)
+user_data = {}
 
-class CandidateFlow(StatesGroup):
-    waiting_name = State()
-    waiting_position = State()
-    waiting_cv = State()
-
-async def analyze_cv(file_path, position):
+def analyze_cv(file_path, position):
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-1.5-flash")
     with open(file_path, "rb") as f:
         pdf_bytes = f.read()
-    prompt = f'Siz HR mutaxassisisiz. CV ni "{position}" uchun baholang. FAQAT JSON: {{"score": 0-100, "summary": "baho", "strengths": "kuchli", "weaknesses": "zaif", "recommendation": "xulosa"}}'
-    response = model.generate_content([{"mime_type": "application/pdf", "data": pdf_bytes}, prompt])
+    prompt = f'HR sifatida CV ni "{position}" uchun baholang. FAQAT JSON: {{"score":0-100,"summary":"baho","strengths":"kuchli","weaknesses":"zaif","recommendation":"xulosa"}}'
+    response = model.generate_content([{"mime_type":"application/pdf","data":pdf_bytes},prompt])
     raw = response.text.strip().replace("```json","").replace("```","").strip()
     return json.loads(raw)
-    async def write_to_sheets(name, position, username, result):
+
+def write_to_sheets(name, position, username, result):
     scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDENTIALS_JSON), scopes=scopes)
+    creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDENTIALS_JSON),scopes=scopes)
     sheet = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID).sheet1
     if sheet.cell(1,1).value != "Sana":
         sheet.insert_row(["Sana","Ism","Lavozim","Telegram","Ball","Xulosa","Kuchli","Zaif","Tavsiya"],1)
     sheet.append_row([datetime.now().strftime("%d.%m.%Y %H:%M"),name,position,f"@{username}",result.get("score",0),result.get("summary",""),result.get("strengths",""),result.get("weaknesses",""),result.get("recommendation","")])
 
-@dp.message(CommandStart())
-async def start(message: Message, state: FSMContext):
-    await message.answer("👋 *Blitz HR Bot*ga xush kelibsiz!\n\nIsmingiz va familiyangizni kiriting:", parse_mode="Markdown")
-    await state.set_state(CandidateFlow.waiting_name)
+@bot.message_handler(commands=["start"])
+def start(message):
+    user_data[message.chat.id] = {}
+    bot.send_message(message.chat.id,"👋 *Blitz HR Bot*ga xush kelibsiz!\n\nIsmingiz va familiyangizni kiriting:",parse_mode="Markdown")
+    bot.register_next_step_handler(message, get_name)
 
-@dp.message(CandidateFlow.waiting_name)
-async def get_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await message.answer(f"✅ Salom *{message.text}*!\n\nQaysi lavozimga ariza topshiryapsiz?", parse_mode="Markdown")
-    await state.set_state(CandidateFlow.waiting_position)
+def get_name(message):
+    user_data[message.chat.id]["name"] = message.text
+    bot.send_message(message.chat.id,f"✅ Salom *{message.text}*!\n\nQaysi lavozimga ariza topshiryapsiz?",parse_mode="Markdown")
+    bot.register_next_step_handler(message, get_position)
 
-@dp.message(CandidateFlow.waiting_position)
-async def get_position(message: Message, state: FSMContext):
-    await state.update_data(position=message.text)
-    await message.answer(f"📄 CV ni yuboring.\n\n⚠️ Faqat *PDF*!", parse_mode="Markdown")
-    await state.set_state(CandidateFlow.waiting_cv)
+def get_position(message):
+    user_data[message.chat.id]["position"] = message.text
+    bot.send_message(message.chat.id,"📄 CV ni yuboring.\n\n⚠️ Faqat *PDF* formatida!",parse_mode="Markdown")
+    bot.register_next_step_handler(message, get_cv)
 
-@dp.message(CandidateFlow.waiting_cv, F.document)
-async def get_cv(message: Message, state: FSMContext):
-    document = message.document
-    if not document.file_name.lower().endswith(".pdf"):
-        await message.answer("❌ Faqat *PDF* yuboring!", parse_mode="Markdown")
+def get_cv(message):
+    if not message.document or not message.document.file_name.lower().endswith(".pdf"):
+        bot.send_message(message.chat.id,"❌ Faqat *PDF* yuboring!",parse_mode="Markdown")
+        bot.register_next_step_handler(message, get_cv)
         return
-    await message.answer("⏳ CV tahlil qilinmoqda, 20-30 sekund kuting...")
-    data = await state.get_data()
-    file = await bot.get_file(document.file_id)
-    file_path = f"/tmp/{document.file_name}"
-    await bot.download_file(file.file_path, file_path)
+    bot.send_message(message.chat.id,"⏳ CV tahlil qilinmoqda, 20-30 sekund kuting...")
+    data = user_data[message.chat.id]
+    file_info = bot.get_file(message.document.file_id)
+    downloaded = bot.download_file(file_info.file_path)
+    file_path = f"/tmp/{message.document.file_name}"
+    with open(file_path,"wb") as f:
+        f.write(downloaded)
     try:
-        result = await analyze_cv(file_path, data["position"])
-        await write_to_sheets(data["name"], data["position"], message.from_user.username or "noma'lum", result)
+        result = analyze_cv(file_path, data["position"])
+        write_to_sheets(data["name"],data["position"],message.from_user.username or "noma'lum",result)
         e = "🟢" if result["score"]>=70 else "🟡" if result["score"]>=40 else "🔴"
-        await message.answer(f"✅ *Natija*\n\n👤 {data['name']}\n💼 {data['position']}\n{e} *{result['score']}%*\n\n📊 {result['summary']}\n\n💪 {result['strengths']}\n\n📈 {result['weaknesses']}\n\n🏁 {result['recommendation']}", parse_mode="Markdown")
+        bot.send_message(message.chat.id,f"✅ *Natija*\n\n👤 {data['name']}\n💼 {data['position']}\n{e} *{result['score']}%*\n\n📊 {result['summary']}\n\n💪 {result['strengths']}\n\n📈 {result['weaknesses']}\n\n🏁 {result['recommendation']}",parse_mode="Markdown")
         if HR_CHAT_ID:
-            await bot.send_message(int(HR_CHAT_ID), f"🔔 *Yangi ariza!*\n👤 {data['name']}\n💼 {data['position']}\n{e} *{result['score']}%*\n📱 @{message.from_user.username or 'yoq'}", parse_mode="Markdown")
+            bot.send_message(int(HR_CHAT_ID),f"🔔 *Yangi ariza!*\n👤 {data['name']}\n💼 {data['position']}\n{e} *{result['score']}%*\n📱 @{message.from_user.username or 'yoq'}",parse_mode="Markdown")
     except Exception as ex:
-        logging.error(f"Xato: {ex}")
-        await message.answer("❌ Xatolik yuz berdi.")
-    await state.clear()
+        bot.send_message(message.chat.id,"❌ Xatolik yuz berdi. Qaytadan /start bosing.")
+    os.remove(file_path)
 
-@dp.message(CandidateFlow.waiting_cv)
-async def wrong_format(message: Message):
-    await message.answer("📎 PDF fayl yuboring!")
-
-async def main():
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+bot.polling(none_stop=True)
